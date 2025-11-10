@@ -1,0 +1,109 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environment
+venv/
+ENV/
+env/
+.venv
+
+# PyCharm
+.idea/
+
+# VS Code
+.vscode/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# PyTorch
+*.pth
+*.pt
+*.onnx
+*.engine
+checkpoints/
+!checkpoints/.gitkeep
+
+# Data
+data/processed/images/
+data/processed/masks/
+!data/.gitkeep
+datasets/
+!datasets/.gitkeep
+cache/
+*.mdb
+*.lmdb
+
+# Logs
+logs/
+*.log
+runs/
+wandb/
+
+# OS
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# IDE
+*.sublime-project
+*.sublime-workspace
+
+# Java
+*.class
+*.jar
+*.war
+*.ear
+target/
+.gradle/
+build/
+out/
+
+# Node
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# Docker
+.dockerignore
+
+# 特定项目文件
+organize_docs.py
+
+# 训练输出
+outputs/
+*.pth
+*.onnx
+train.log
+*.log
+
+*.zip
+*.bin
+docs/

@@ -1,0 +1,37 @@
+{
+  "total_samples": 4078,
+  "splits": {
+    "train": 2489,
+    "val": 533,
+    "test": 1056
+  },
+  "split_ratios": {
+    "train": 0.610348209906817,
+    "val": 0.13070132417851887,
+    "test": 0.25895046591466403
+  },
+  "train_image_stats": {
+    "mean_height": 672,
+    "mean_width": 504,
+    "min_height": 672,
+    "max_height": 672,
+    "min_width": 504,
+    "max_width": 504
+  },
+  "val_image_stats": {
+    "mean_height": 672,
+    "mean_width": 504,
+    "min_height": 672,
+    "max_height": 672,
+    "min_width": 504,
+    "max_width": 504
+  },
+  "test_image_stats": {
+    "mean_height": 672,
+    "mean_width": 504,
+    "min_height": 672,
+    "max_height": 672,
+    "min_width": 504,
+    "max_width": 504
+  }
+}
