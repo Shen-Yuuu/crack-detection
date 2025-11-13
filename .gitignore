@@ -106,4 +106,5 @@ train.log
 
 *.zip
 *.bin
-docs/
+
+docs/reference/
