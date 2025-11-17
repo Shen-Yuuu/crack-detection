@@ -2,7 +2,6 @@
 高性能数据加载模块
 支持多种格式、多级缓存、难例挖掘
 """
-
 import os
 import json
 import yaml
@@ -11,10 +10,11 @@ import numpy as np
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Union
 from dataclasses import dataclass
+import random
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from PIL import Image
 import lmdb
 import pickle
@@ -33,6 +33,12 @@ class DatasetConfig:
     normalize_std: Tuple[float, float, float] = (0.229, 0.224, 0.225)
     use_cache: bool = True
     cache_dir: str = "./cache"
+    min_mask_ratio: float = 0.001
+    mixup_prob: float = 0.0
+    cutmix_prob: float = 0.0
+    mix_alpha: float = 0.4
+    focus_crop_prob: float = 0.0
+    hard_mining_update_interval: int = 256
 
 
 class AnnotationConverter:
@@ -192,12 +198,15 @@ class CrackDataset(Dataset):
         self.config = config
         self.transform = transform
         self.use_hard_mining = use_hard_mining
+        self.is_training = 'train' in self.config.split
         
         # 加载数据集索引
         self.samples = self._load_samples()
         
         # 难例权重（初始均匀）
-        self.sample_weights = np.ones(len(self.samples))
+        self.sample_weights = np.ones(len(self.samples), dtype=np.float32)
+        self.sample_losses = np.ones(len(self.samples), dtype=np.float32)
+        self._pending_updates = 0
         
         # LMDB缓存
         self.lmdb_env = None
@@ -226,7 +235,8 @@ class CrackDataset(Dataset):
         failed_checks = {
             'image_not_found': 0,
             'mask_not_found': 0,
-            'size_mismatch': 0
+            'size_mismatch': 0,
+            'tiny_mask': 0
         }
         
         with open(split_file, 'r') as f:
@@ -258,6 +268,19 @@ class CrackDataset(Dataset):
                 
                 if not mask_path.exists():
                     failed_checks['mask_not_found'] += 1
+                    continue
+
+                # 读取掩码以检查有效标注比例
+                mask_raw = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+                if mask_raw is None:
+                    failed_checks['mask_not_found'] += 1
+                    continue
+
+                mask_ratio = float(np.count_nonzero(mask_raw)) / float(mask_raw.size)
+                if mask_ratio < self.config.min_mask_ratio:
+                    failed_checks['tiny_mask'] += 1
+                    if idx < 3:
+                        print(f"  ❌ 掩码有效像素过少 ({mask_ratio:.6f})")
                     continue
                 
                 # 质量检查（只检查前100个样本以加快速度）
@@ -294,6 +317,7 @@ class CrackDataset(Dataset):
         print(f"  - 图像未找到: {failed_checks['image_not_found']}")
         print(f"  - 掩码未找到: {failed_checks['mask_not_found']}")
         print(f"  - 尺寸不匹配: {failed_checks['size_mismatch']}")
+        print(f"  - 掩码占比过低: {failed_checks['tiny_mask']}")
         print(f"  - 成功加载: {len(samples)}")
         print(f"{'='*60}\n")
         
@@ -337,60 +361,209 @@ class CrackDataset(Dataset):
         with self.lmdb_env.begin(write=True) as txn:
             txn.put(str(idx).encode(), pickle.dumps((image, mask)))
     
+
+    def _load_image_mask(self, idx: int) -> Tuple[np.ndarray, np.ndarray]:
+        """加载单个样本的图像和掩码（带缓存）"""
+        cached = self._get_from_cache(idx)
+        if cached is not None:
+            image, mask = cached
+            return image.copy(), mask.copy()
+
+        sample = self.samples[idx]
+        image = cv2.imread(sample['image'])
+        if image is None:
+            raise FileNotFoundError(f"无法读取图像: {sample['image']}")
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+        mask = cv2.imread(sample['mask'], cv2.IMREAD_GRAYSCALE)
+        if mask is None:
+            raise FileNotFoundError(f"无法读取掩码: {sample['mask']}")
+
+        mask = QualityControl.filter_small_artifacts(mask)
+
+        # 写入缓存
+        self._put_to_cache(idx, image, mask)
+
+        return image.copy(), mask.copy()
+
+    def _random_focus_crop(self, image: np.ndarray, mask: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """围绕裂缝区域随机裁剪"""
+        if (not self.is_training or self.config.focus_crop_prob <= 0 or
+                random.random() > self.config.focus_crop_prob):
+            return image, mask
+
+        coords = np.column_stack(np.where(mask > 0))
+        if coords.size == 0:
+            return image, mask
+
+        y_min, x_min = coords.min(axis=0)
+        y_max, x_max = coords.max(axis=0)
+
+        h, w = image.shape[:2]
+        bbox_h = max(y_max - y_min + 1, 1)
+        bbox_w = max(x_max - x_min + 1, 1)
+
+        scale = random.uniform(1.1, 1.6)
+        crop_h = min(int(bbox_h * scale), h)
+        crop_w = min(int(bbox_w * scale), w)
+
+        center_y = random.randint(max(y_min - bbox_h // 2, 0), min(y_max + bbox_h // 2, h - 1))
+        center_x = random.randint(max(x_min - bbox_w // 2, 0), min(x_max + bbox_w // 2, w - 1))
+
+        y1 = max(center_y - crop_h // 2, 0)
+        x1 = max(center_x - crop_w // 2, 0)
+        y2 = min(y1 + crop_h, h)
+        x2 = min(x1 + crop_w, w)
+        y1 = max(y2 - crop_h, 0)
+        x1 = max(x2 - crop_w, 0)
+
+        return image[y1:y2, x1:x2], mask[y1:y2, x1:x2]
+
+    def _apply_mixup(self, image: np.ndarray, mask: np.ndarray, idx: int) -> Tuple[np.ndarray, np.ndarray]:
+        if (not self.is_training or self.config.mixup_prob <= 0 or
+                random.random() > self.config.mixup_prob or len(self.samples) < 2):
+            return image, mask
+
+        mix_idx = random.randrange(len(self.samples))
+        if mix_idx == idx:
+            return image, mask
+
+        mix_image, mix_mask = self._load_image_mask(mix_idx)
+
+        target_h, target_w = image.shape[:2]
+        if mix_image.shape[:2] != (target_h, target_w):
+            mix_image = cv2.resize(mix_image, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+            mix_mask = cv2.resize(mix_mask, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
+
+        lam = np.random.beta(self.config.mix_alpha, self.config.mix_alpha)
+
+        image_mix = lam * image.astype(np.float32) + (1 - lam) * mix_image.astype(np.float32)
+        mask_mix = lam * (mask.astype(np.float32) / 255.0) + (1 - lam) * (mix_mask.astype(np.float32) / 255.0)
+
+        image_mix = np.clip(image_mix, 0, 255).astype(np.uint8)
+        mask_mix = np.clip(mask_mix, 0.0, 1.0)
+
+        return image_mix, (mask_mix * 255.0).astype(np.uint8)
+
+    def _apply_cutmix(self, image: np.ndarray, mask: np.ndarray, idx: int) -> Tuple[np.ndarray, np.ndarray]:
+        if (not self.is_training or self.config.cutmix_prob <= 0 or
+                random.random() > self.config.cutmix_prob or len(self.samples) < 2):
+            return image, mask
+
+        mix_idx = random.randrange(len(self.samples))
+        if mix_idx == idx:
+            return image, mask
+
+        mix_image, mix_mask = self._load_image_mask(mix_idx)
+
+        target_h, target_w = image.shape[:2]
+        if mix_image.shape[:2] != (target_h, target_w):
+            mix_image = cv2.resize(mix_image, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+            mix_mask = cv2.resize(mix_mask, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
+
+        h, w = image.shape[:2]
+        lam = np.random.beta(self.config.mix_alpha, self.config.mix_alpha)
+        cut_ratio = np.sqrt(1 - lam)
+        cut_h = max(1, int(h * cut_ratio))
+        cut_w = max(1, int(w * cut_ratio))
+
+        cy = random.randint(0, h - 1)
+        cx = random.randint(0, w - 1)
+
+        y1 = np.clip(cy - cut_h // 2, 0, h)
+        x1 = np.clip(cx - cut_w // 2, 0, w)
+        y2 = np.clip(cy + cut_h // 2, 0, h)
+        x2 = np.clip(cx + cut_w // 2, 0, w)
+
+        image[y1:y2, x1:x2] = mix_image[y1:y2, x1:x2]
+        mask[y1:y2, x1:x2] = mix_mask[y1:y2, x1:x2]
+
+        return image, mask
+
+    def get_sampling_weights(self) -> torch.Tensor:
+        return torch.as_tensor(self.sample_weights, dtype=torch.double)
+
+    def on_epoch_start(self):
+        if self.use_hard_mining and len(self.samples) > 0:
+            self.update_sample_weights(self.sample_losses)
+            self._pending_updates = 0
+
+    
+    def record_sample_losses(self, indices: np.ndarray, losses: torch.Tensor):
+        if not self.use_hard_mining or len(self.samples) == 0:
+            return
+
+        losses_np = losses.detach().cpu().numpy()
+        self.sample_losses[indices] = losses_np
+        self._pending_updates += len(indices)
+
+        if self._pending_updates >= self.config.hard_mining_update_interval:
+            self.update_sample_weights(self.sample_losses)
+            self._pending_updates = 0
+
     def __len__(self) -> int:
         return len(self.samples)
     
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         """获取样本"""
-        # 尝试从缓存加载
-        cached = self._get_from_cache(idx)
-        if cached is not None:
-            image, mask = cached
-        else:
-            # 从磁盘加载
-            sample = self.samples[idx]
-            image = cv2.imread(sample['image'])
-            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-            
-            mask = cv2.imread(sample['mask'], cv2.IMREAD_GRAYSCALE)
-            
-            # 质量控制：过滤小伪影
-            mask = QualityControl.filter_small_artifacts(mask)
-            
-            # 写入缓存
-            self._put_to_cache(idx, image, mask)
-        
-        # 数据增强
+        image, mask = self._load_image_mask(idx)
+
+        # 聚焦裁剪
+        image, mask = self._random_focus_crop(image, mask)
+
+        # MixUp / CutMix
+        image, mask = self._apply_mixup(image, mask, idx)
+        image, mask = self._apply_cutmix(image, mask, idx)
+
         if self.transform is not None:
             transformed = self.transform(image=image, mask=mask)
             image = transformed['image']
             mask = transformed['mask']
-            
-            # 归一化mask到0/1（已经是Tensor）
-            mask = (mask > 0.5).float()
-            # 添加 channel 维度: [H, W] -> [1, H, W]
+
+            mask = mask.float().clamp_(0.0, 1.0)
             mask = mask.unsqueeze(0)
         else:
-            # 如果没有transform，手动处理
             mask = (mask > 128).astype(np.float32)
-            # 添加 channel 维度
             mask = np.expand_dims(mask, axis=0)
-        
+
         return {
             'image': image,
             'mask': mask,
             'id': self.samples[idx]['id'],
-            'weight': self.sample_weights[idx]
+            'weight': float(self.sample_weights[idx]),
+            'index': idx
         }
-    
+
     def update_sample_weights(self, losses: np.ndarray):
         """更新难例权重（Hard Example Mining）"""
-        if not self.use_hard_mining:
+        if not self.use_hard_mining or len(self.samples) == 0:
             return
-        
-        # 基于损失值更新权重
-        self.sample_weights = losses / (losses.mean() + 1e-8)
-        self.sample_weights = np.clip(self.sample_weights, 0.5, 2.0)
+
+        losses = np.asarray(losses, dtype=np.float32)
+        valid = losses > 0
+        if not np.any(valid):
+            return
+
+        mean_loss = losses[valid].mean()
+        normalized = losses / (mean_loss + 1e-8)
+        normalized = np.clip(normalized, 0.2, 5.0)
+
+        self.sample_weights = normalized.astype(np.float32)
+
+    def set_epoch_ratio(self, epoch_ratio: float):
+        """根据训练进度动态调整增强策略"""
+        if 'train' not in self.config.split:
+            return
+
+        epoch_ratio = float(np.clip(epoch_ratio, 0.0, 1.0))
+
+        # 避免重复构建完全相同的pipeline
+        current = getattr(self, "_current_epoch_ratio", None)
+        if current is not None and abs(current - epoch_ratio) < 1e-4:
+            return
+
+        self.transform = get_training_augmentation(self.config, epoch_ratio)
+        self._current_epoch_ratio = epoch_ratio
 
 
 def get_training_augmentation(config: DatasetConfig, epoch_ratio: float = 0.0) -> A.Compose:
@@ -430,11 +603,15 @@ def get_training_augmentation(config: DatasetConfig, epoch_ratio: float = 0.0) -
             A.RandomBrightnessContrast(brightness_limit=0.3, contrast_limit=0.3, p=0.5),
             A.HueSaturationValue(hue_shift_limit=20, sat_shift_limit=30, val_shift_limit=20, p=0.5),
             A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1, p=0.3),
+            A.RandomGamma(gamma_limit=(80, 120), p=0.3),
+            A.RandomShadow(p=0.3),
+            A.RandomFog(p=0.2),
         ])
     else:
         transforms.extend([
             A.CLAHE(clip_limit=2.0, p=0.3),
             A.RandomBrightnessContrast(brightness_limit=0.1, contrast_limit=0.1, p=0.3),
+            A.RandomGamma(gamma_limit=(90, 110), p=0.2),
         ])
     
     # 噪声与模糊
@@ -448,25 +625,38 @@ def get_training_augmentation(config: DatasetConfig, epoch_ratio: float = 0.0) -
             A.MedianBlur(blur_limit=7, p=1.0),
             A.GaussianBlur(blur_limit=7, p=1.0),
         ], p=0.2),
+        A.CoarseDropout(max_holes=12, max_height=32, max_width=32, min_holes=4, fill_value=0, p=0.3),
+        A.GridDropout(ratio=0.5, random_offset=True, p=0.15),
     ])
     
     # 裁剪（多尺度训练）
-    if strong_aug and len(config.train_scales) > 1:
-        crop_size = np.random.choice(config.train_scales)
+    if strong_aug and len(config.train_scales) > 0:
+        scale_choice = random.choice(list(config.train_scales))
+        if isinstance(scale_choice, (list, tuple)) and len(scale_choice) >= 2:
+            crop_h = int(scale_choice[0])
+            crop_w = int(scale_choice[1])
+        else:
+            crop_h = int(scale_choice)
+            aspect = float(config.crop_size[1]) / max(float(config.crop_size[0]), 1.0)
+            crop_w = max(1, int(round(crop_h * aspect)))
     else:
-        crop_size = config.crop_size[0]
-    
+        crop_h, crop_w = int(config.crop_size[0]), int(config.crop_size[1])
+
+    crop_h = max(crop_h, 1)
+    crop_w = max(crop_w, 1)
+    max_side = max(crop_h, crop_w)
+
     # 先确保图像大小足够进行裁剪
     # 使用 LongestMaxSize + PadIfNeeded 确保图像不会太小
     transforms.extend([
-        A.LongestMaxSize(max_size=max(crop_size * 2, 1024), p=1.0),  # 确保图像足够大
+        A.LongestMaxSize(max_size=max(max_side * 2, 1024), p=1.0),  # 确保图像足够大
         A.PadIfNeeded(
-            min_height=crop_size,
-            min_width=crop_size,
+            min_height=crop_h,
+            min_width=crop_w,
             border_mode=cv2.BORDER_REFLECT_101,
             p=1.0
         ),
-        A.RandomCrop(height=crop_size, width=crop_size, p=1.0)
+        A.RandomCrop(height=crop_h, width=crop_w, p=1.0)
     ])
     
     # 归一化与转换
@@ -501,15 +691,32 @@ def create_dataloaders(config: DatasetConfig,
         use_hard_mining=True
     )
     
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=True,
-        prefetch_factor=2 if num_workers > 0 else None,  # 只在多进程时设置
-        persistent_workers=True if num_workers > 0 else False
-    )
+    train_sampler = None
+    if train_dataset.use_hard_mining and len(train_dataset) > 0:
+        train_dataset.on_epoch_start()
+        train_sampler = WeightedRandomSampler(
+            weights=train_dataset.get_sampling_weights(),
+            num_samples=len(train_dataset),
+            replacement=True
+        )
+
+    train_loader_kwargs = {
+        'dataset': train_dataset,
+        'batch_size': batch_size,
+        'num_workers': num_workers,
+        'pin_memory': True,
+        'shuffle': train_sampler is None
+    }
+
+    if train_sampler is not None:
+        train_loader_kwargs['sampler'] = train_sampler
+        train_loader_kwargs['shuffle'] = False
+
+    if num_workers > 0:
+        train_loader_kwargs['prefetch_factor'] = 2
+        train_loader_kwargs['persistent_workers'] = False  # 需让 worker 每轮重新载入增强配置
+
+    train_loader = DataLoader(**train_loader_kwargs)
     
     # 验证集
     val_config = DatasetConfig(**{**config.__dict__, 'split': 'val'})
@@ -519,15 +726,19 @@ def create_dataloaders(config: DatasetConfig,
         use_hard_mining=False
     )
     
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True,
-        prefetch_factor=2 if num_workers > 0 else None,  # 只在多进程时设置
-        persistent_workers=True if num_workers > 0 else False
-    )
+    val_loader_kwargs = {
+        'dataset': val_dataset,
+        'batch_size': batch_size,
+        'shuffle': False,
+        'num_workers': num_workers,
+        'pin_memory': True
+    }
+
+    if num_workers > 0:
+        val_loader_kwargs['prefetch_factor'] = 2
+        val_loader_kwargs['persistent_workers'] = False
+
+    val_loader = DataLoader(**val_loader_kwargs)
     
     return train_loader, val_loader
 

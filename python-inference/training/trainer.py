@@ -5,10 +5,11 @@
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.amp import autocast, GradScaler
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import _LRScheduler
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from typing import Dict, Optional, Callable
 import numpy as np
 from pathlib import Path
@@ -119,6 +120,7 @@ class Trainer:
                  optimizer: Optimizer,
                  loss_fn: nn.Module,
                  scheduler: Optional[_LRScheduler] = None,
+                 scheduler_step: str = 'epoch',
                  device: str = 'cuda',
                  output_dir: str = './outputs',
                  use_amp: bool = True,
@@ -134,6 +136,7 @@ class Trainer:
         self.optimizer = optimizer
         self.loss_fn = loss_fn
         self.scheduler = scheduler
+        self.scheduler_step = scheduler_step if scheduler is not None else None
         self.device = device
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -172,6 +175,10 @@ class Trainer:
         """设置日志"""
         logger = logging.getLogger('Trainer')
         logger.setLevel(logging.INFO)
+        logger.propagate = False
+
+        if logger.handlers:
+            logger.handlers.clear()
         
         # 文件处理器
         fh = logging.FileHandler(self.output_dir / 'train.log')
@@ -197,9 +204,6 @@ class Trainer:
         """训练一个epoch"""
         self.model.train()
         self.train_tracker.reset()
-        
-        # 动态调整增强强度（通过epoch_ratio）
-        epoch_ratio = epoch / 200  # total_epochs 默认为 200
         
         pbar = tqdm(train_loader, desc=f'Epoch {epoch}')
         
@@ -253,12 +257,35 @@ class Trainer:
                 if self.use_ema:
                     self.ema.update()
                 
+                if self.scheduler and self.scheduler_step == 'step':
+                    self.scheduler.step()
+
                 self.global_step += 1
             
             # 记录指标
             metrics = {k: v.item() if isinstance(v, torch.Tensor) else v 
                       for k, v in losses.items()}
             self.train_tracker.update(metrics)
+
+            # 记录难例损失
+            if 'index' in batch and hasattr(train_loader.dataset, 'record_sample_losses'):
+                indices = batch['index']
+                if isinstance(indices, torch.Tensor):
+                    indices_np = indices.detach().cpu().numpy().astype(np.int64)
+                else:
+                    indices_np = np.asarray(indices, dtype=np.int64)
+
+                with torch.no_grad():
+                    per_sample_loss = F.binary_cross_entropy_with_logits(
+                        outputs['out'], masks, reduction='none'
+                    )
+                    per_sample_loss = per_sample_loss.mean(dim=(1, 2, 3))
+
+                train_loader.dataset.record_sample_losses(indices_np, per_sample_loss)
+
+                sampler = getattr(train_loader, 'sampler', None)
+                if isinstance(sampler, WeightedRandomSampler):
+                    sampler.weights = train_loader.dataset.get_sampling_weights()
             
             # 更新进度条
             if batch_idx % self.log_interval == 0:
@@ -269,7 +296,7 @@ class Trainer:
                 })
         
         # 学习率调度
-        if self.scheduler is not None:
+        if self.scheduler and self.scheduler_step == 'epoch':
             self.scheduler.step()
         
         # SWA更新
@@ -398,6 +425,8 @@ class Trainer:
               early_stopping_patience: int = 20):
         """完整训练流程"""
         
+        self.total_epochs = num_epochs
+
         self.logger.info("Starting training...")
         self.logger.info(f"Total epochs: {num_epochs}")
         self.logger.info(f"Training samples: {len(train_loader.dataset)}")
@@ -407,19 +436,34 @@ class Trainer:
         
         for epoch in range(self.current_epoch, num_epochs):
             self.current_epoch = epoch
+
+            epoch_ratio = epoch / max(num_epochs - 1, 1)
+            dataset = getattr(train_loader, 'dataset', None)
+            if dataset is not None and hasattr(dataset, 'set_epoch_ratio'):
+                dataset.set_epoch_ratio(epoch_ratio)
+
+            if dataset is not None and hasattr(dataset, 'on_epoch_start'):
+                dataset.on_epoch_start()
+                sampler = getattr(train_loader, 'sampler', None)
+                if isinstance(sampler, WeightedRandomSampler):
+                    sampler.weights = dataset.get_sampling_weights()
             
             # 训练
             train_metrics = self.train_epoch(train_loader, epoch)
             
             # 验证
             val_metrics = self.validate(val_loader)
+
+            if self.scheduler and self.scheduler_step == 'metric':
+                self.scheduler.step(val_metrics['iou'])
             
             # 日志
             self.logger.info(
                 f"Epoch {epoch}: "
                 f"Train Loss: {train_metrics['total']:.4f}, "
                 f"Val Loss: {val_metrics['total']:.4f}, "
-                f"Val IoU: {val_metrics['iou']:.4f}"
+                f"Val IoU: {val_metrics['iou']:.4f}, "
+                f"LR: {self.optimizer.param_groups[0]['lr']:.6f}"
             )
             
             # 保存检查点

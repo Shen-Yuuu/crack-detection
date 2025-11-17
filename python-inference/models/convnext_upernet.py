@@ -229,7 +229,8 @@ class UPerNetDecoder(nn.Module):
     def __init__(self,
                  encoder_channels: List[int],
                  decoder_channels: int = 256,
-                 num_classes: int = 1):
+                 num_classes: int = 1,
+                 head_dropout: float = 0.1):
         super().__init__()
 
         # PPM模块（应用于最深层特征）
@@ -270,7 +271,7 @@ class UPerNetDecoder(nn.Module):
             nn.Conv2d(decoder_channels, head_channels, 3, padding=1, bias=False),
             nn.GroupNorm(head_groups, head_channels),
             nn.ReLU(inplace=True),
-            nn.Dropout2d(0.1),
+            nn.Dropout2d(head_dropout),
             nn.Conv2d(head_channels, num_classes, 1)
         )
 
@@ -389,7 +390,8 @@ class ConvNeXtUPerNet(nn.Module):
                  num_classes: int = 1,
                  decoder_channels: int = 256,
                  deep_supervision: bool = True,
-                 edge_branch: bool = True):
+                 edge_branch: bool = True,
+                 head_dropout: float = 0.1):
         super().__init__()
 
         self.deep_supervision = deep_supervision
@@ -400,7 +402,7 @@ class ConvNeXtUPerNet(nn.Module):
         encoder_channels = self.encoder.out_channels
 
         # 解码器
-        self.decoder = UPerNetDecoder(encoder_channels, decoder_channels, num_classes)
+        self.decoder = UPerNetDecoder(encoder_channels, decoder_channels, num_classes, head_dropout=head_dropout)
 
         # 边界分支
         if edge_branch:
@@ -484,7 +486,8 @@ def create_model(model_config: dict) -> nn.Module:
             num_classes=model_config.get('num_classes', 1),
             decoder_channels=model_config.get('decoder_channels', 256),
             deep_supervision=model_config.get('deep_supervision', True),
-            edge_branch=model_config.get('edge_branch', True)
+            edge_branch=model_config.get('edge_branch', True),
+            head_dropout=model_config.get('head_dropout', 0.1)
         )
     else:
         raise ValueError(f"Unsupported model type: {model_type}")

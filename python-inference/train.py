@@ -5,7 +5,13 @@
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import OneCycleLR, CosineAnnealingLR
+from torch.optim.lr_scheduler import (
+    OneCycleLR,
+    CosineAnnealingLR,
+    ReduceLROnPlateau,
+    LinearLR,
+    SequentialLR,
+)
 import yaml
 import argparse
 from pathlib import Path
@@ -56,10 +62,10 @@ def create_optimizer(model: nn.Module, config: dict):
     return optimizer
 
 
-def create_scheduler(optimizer, config: dict, steps_per_epoch: int):
+def create_scheduler(optimizer, config: dict, steps_per_epoch: int, total_epochs: int):
     """创建学习率调度器"""
     scheduler_type = config.get('type', 'cosine')
-    num_epochs = config.get('epochs', 200)
+    num_epochs = config.get('epochs', total_epochs)
     
     if scheduler_type == 'onecycle':
         scheduler = OneCycleLR(
@@ -69,16 +75,55 @@ def create_scheduler(optimizer, config: dict, steps_per_epoch: int):
             steps_per_epoch=steps_per_epoch,
             pct_start=config.get('warmup_pct', 0.05)
         )
+        step_mode = 'step'
     elif scheduler_type == 'cosine':
         scheduler = CosineAnnealingLR(
             optimizer,
             T_max=num_epochs,
             eta_min=config.get('min_lr', 1e-6)
         )
+        step_mode = 'epoch'
+    elif scheduler_type == 'cosine_warmup':
+        warmup_epochs = int(config.get('warmup_epochs', max(1, int(0.05 * num_epochs))))
+        warmup_epochs = max(warmup_epochs, 1)
+        warmup_start = float(config.get('warmup_start_factor', 0.1))
+        warmup_start = max(min(warmup_start, 1.0), 1e-4)
+
+        warmup_scheduler = LinearLR(
+            optimizer,
+            start_factor=warmup_start,
+            end_factor=1.0,
+            total_iters=warmup_epochs
+        )
+
+        cosine_epochs = max(num_epochs - warmup_epochs, 1)
+        cosine_scheduler = CosineAnnealingLR(
+            optimizer,
+            T_max=cosine_epochs,
+            eta_min=config.get('min_lr', 1e-6)
+        )
+
+        scheduler = SequentialLR(
+            optimizer,
+            schedulers=[warmup_scheduler, cosine_scheduler],
+            milestones=[warmup_epochs]
+        )
+        step_mode = 'epoch'
+    elif scheduler_type == 'plateau':
+        scheduler = ReduceLROnPlateau(
+            optimizer,
+            mode=config.get('mode', 'max'),
+            factor=config.get('factor', 0.5),
+            patience=config.get('patience', 5),
+            verbose=True,
+            min_lr=config.get('min_lr', 1e-7)
+        )
+        step_mode = 'metric'
     else:
         scheduler = None
+        step_mode = None
     
-    return scheduler
+    return scheduler, step_mode
 
 
 def find_latest_checkpoint(output_dir):
@@ -152,19 +197,20 @@ def main():
     optimizer = create_optimizer(model, config['optimizer'])
     
     # 创建调度器
-    scheduler = create_scheduler(
-        optimizer, 
+    scheduler, scheduler_step = create_scheduler(
+        optimizer,
         config['scheduler'],
-        len(train_loader)
+        len(train_loader),
+        config['training']['epochs']
     )
     
     # 创建训练器
     print("\nCreating trainer...")
     trainer = Trainer(
         model=model,
-        optimizer=optimizer,
         loss_fn=loss_fn,
         scheduler=scheduler,
+        scheduler_step=scheduler_step or 'epoch',
         device=device,
         output_dir=config['training']['output_dir'],
         use_amp=config['training'].get('use_amp', True),
