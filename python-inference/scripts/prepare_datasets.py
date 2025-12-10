@@ -198,7 +198,10 @@ class DatasetNormalizer:
         
         base_path = self.source_root / 'CrackDataset-main' / subset_name
         
-        # 处理训练集
+        # 收集所有图像-掩码对
+        all_pairs = []
+        
+        # 收集训练集
         train_img_path = base_path / image_dir
         train_label_path = base_path / label_dir
         
@@ -206,44 +209,34 @@ class DatasetNormalizer:
             print(f"Warning: {train_img_path} not found, skipping")
             return
         
-        # 获取所有图像
-        image_files = sorted(list(train_img_path.glob('*.jpg')))
-        
-        # 随机打乱
-        random.shuffle(image_files)
-        
-        processed = 0
-        for idx, img_file in enumerate(tqdm(image_files, desc=f"{subset_name} train")):
-            # 查找对应的掩码
+        train_image_files = sorted(list(train_img_path.glob('*.jpg')))
+        for img_file in train_image_files:
             mask_file = train_label_path / img_file.with_suffix('.png').name
-            
-            if not mask_file.exists():
-                continue
-            
-            # 分配split
-            split = self.assign_split(idx, len(image_files))
-            
-            # 复制样本
-            if self.copy_sample(img_file, mask_file, split, f"{subset_name}_"):
-                processed += 1
+            if mask_file.exists():
+                all_pairs.append((img_file, mask_file))
         
-        # 处理验证集（如果存在）
+        # 收集验证集（如果存在）
         if val_dir and val_label_dir:
             val_img_path = base_path / val_dir
             val_label_path = base_path / val_label_dir
             
             if val_img_path.exists() and val_label_path.exists():
                 val_image_files = sorted(list(val_img_path.glob('*.jpg')))
-                
-                for img_file in tqdm(val_image_files, desc=f"{subset_name} val"):
+                for img_file in val_image_files:
                     mask_file = val_label_path / img_file.with_suffix('.png').name
-                    
-                    if not mask_file.exists():
-                        continue
-                    
-                    # 验证集统一放到test split
-                    if self.copy_sample(img_file, mask_file, 'test', f"{subset_name}_val_"):
-                        processed += 1
+                    if mask_file.exists():
+                        all_pairs.append((img_file, mask_file))
+        
+        # 统一随机打乱所有样本
+        random.shuffle(all_pairs)
+        
+        # 按70/15/15分割
+        processed = 0
+        for idx, (img_file, mask_file) in enumerate(tqdm(all_pairs, desc=subset_name)):
+            split = self.assign_split(idx, len(all_pairs))
+            
+            if self.copy_sample(img_file, mask_file, split, f"{subset_name}_"):
+                processed += 1
         
         print(f"✓ {subset_name}: 处理了 {processed} 个样本")
     
