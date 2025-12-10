@@ -208,6 +208,7 @@ def main():
     print("\nCreating trainer...")
     trainer = Trainer(
         model=model,
+        optimizer=optimizer,
         loss_fn=loss_fn,
         scheduler=scheduler,
         scheduler_step=scheduler_step or 'epoch',
@@ -218,6 +219,7 @@ def main():
         ema_decay=config['training'].get('ema_decay', 0.9995),
         use_swa=config['training'].get('use_swa', True),
         swa_start_epoch=config['training'].get('swa_start_epoch', 180),
+        swa_lr=config['training'].get('swa_lr', None),
         gradient_accumulation_steps=config['training'].get('gradient_accumulation_steps', 1),
         max_grad_norm=config['training'].get('max_grad_norm', 1.0)
     )

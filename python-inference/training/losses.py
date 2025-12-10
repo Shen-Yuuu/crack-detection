@@ -290,23 +290,40 @@ class CombinedLoss(nn.Module):
             eroded = (eroded == kernel_size * kernel_size).float()
             
             edge_target = target - eroded
-            edge_loss = F.binary_cross_entropy_with_logits(edge_pred, edge_target)
             
-            losses['edge'] = edge_loss
-            main_loss = main_loss + 0.5 * edge_loss
+            # 对边界预测进行数值稳定性处理
+            edge_pred_clamped = torch.clamp(edge_pred, min=-20.0, max=20.0)
+            edge_loss = F.binary_cross_entropy_with_logits(edge_pred_clamped, edge_target)
+            
+            if torch.isfinite(edge_loss):
+                losses['edge'] = edge_loss
+                main_loss = main_loss + 0.5 * edge_loss
+            else:
+                losses['edge'] = torch.tensor(0.0, device=pred.device)
         
-        # 深度监督损失
+        # 深度监督损失（带数值稳定性保护）
         if aux_preds is not None:
             aux_loss = 0
+            valid_aux_count = 0
             for i, aux_pred in enumerate(aux_preds):
-                weight = 0.4 / len(aux_preds)  # 辅助损失总权重0.4
-                aux_loss += weight * (
-                    self.dice_loss(aux_pred, target) +
-                    self.focal_loss(aux_pred, target)
-                )
+                # 对辅助输出进行数值稳定性处理
+                aux_pred_clamped = torch.clamp(aux_pred, min=-20.0, max=20.0)
+                
+                aux_dice = self.dice_loss(aux_pred_clamped, target)
+                aux_focal = self.focal_loss(aux_pred_clamped, target)
+                
+                # 检查是否为有限值
+                if torch.isfinite(aux_dice) and torch.isfinite(aux_focal):
+                    weight = 0.4 / len(aux_preds)
+                    aux_loss += weight * (aux_dice + aux_focal)
+                    valid_aux_count += 1
             
-            losses['aux'] = aux_loss
-            main_loss = main_loss + aux_loss
+            # 只有当存在有效的辅助损失时才添加
+            if valid_aux_count > 0 and torch.isfinite(aux_loss):
+                losses['aux'] = aux_loss
+                main_loss = main_loss + aux_loss
+            else:
+                losses['aux'] = torch.tensor(0.0, device=pred.device)
         
         losses['total'] = main_loss
         

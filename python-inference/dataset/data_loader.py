@@ -493,9 +493,20 @@ class CrackDataset(Dataset):
         if not self.use_hard_mining or len(self.samples) == 0:
             return
 
-        losses_np = losses.detach().cpu().numpy()
-        self.sample_losses[indices] = losses_np
-        self._pending_updates += len(indices)
+        losses_np = losses.detach().cpu().numpy().astype(np.float32)
+        valid = np.isfinite(losses_np) & (losses_np >= 0.0)
+
+        if np.any(valid):
+            self.sample_losses[indices[valid]] = losses_np[valid]
+
+        invalid = ~valid
+        if np.any(invalid):
+            # 对于 NaN/负值样本，保持原有损失并赋予中性权重
+            self.sample_losses[indices[invalid]] = np.maximum(
+                self.sample_losses[indices[invalid]], 1e-6
+            )
+
+        self._pending_updates += int(np.sum(valid))
 
         if self._pending_updates >= self.config.hard_mining_update_interval:
             self.update_sample_weights(self.sample_losses)
@@ -535,18 +546,38 @@ class CrackDataset(Dataset):
         }
 
     def update_sample_weights(self, losses: np.ndarray):
-        """更新难例权重（Hard Example Mining）"""
+        """更新难例权重（Hard Example Mining）- 增强稳定性版本"""
         if not self.use_hard_mining or len(self.samples) == 0:
             return
 
         losses = np.asarray(losses, dtype=np.float32)
-        valid = losses > 0
+        
+        # 过滤无效值（增加上限检查）
+        valid = np.isfinite(losses) & (losses > 0) & (losses < 1e6)
         if not np.any(valid):
+            self.sample_weights = np.ones(len(self.samples), dtype=np.float32)
             return
 
-        mean_loss = losses[valid].mean()
-        normalized = losses / (mean_loss + 1e-8)
-        normalized = np.clip(normalized, 0.2, 5.0)
+        # 使用中位数而非均值，更鲁棒
+        median_loss = np.median(losses[valid])
+        if median_loss <= 0:
+            median_loss = 1.0
+            
+        normalized = losses / (median_loss + 1e-8)
+        
+        # 更保守的裁剪范围
+        normalized = np.clip(normalized, 0.5, 3.0)
+
+        # 对无效样本使用中性权重
+        normalized[~valid] = 1.0
+        normalized = np.nan_to_num(normalized, nan=1.0, posinf=3.0, neginf=0.5)
+
+        # 确保权重非负且和为正
+        normalized = np.maximum(normalized, 1e-6)
+
+        total = np.sum(normalized)
+        if not np.isfinite(total) or total <= 0:
+            normalized = np.ones_like(normalized, dtype=np.float32)
 
         self.sample_weights = normalized.astype(np.float32)
 

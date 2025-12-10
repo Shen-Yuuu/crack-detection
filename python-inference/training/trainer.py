@@ -128,6 +128,7 @@ class Trainer:
                  ema_decay: float = 0.9995,
                  use_swa: bool = True,
                  swa_start_epoch: int = 180,
+                 swa_lr: Optional[float] = None,
                  gradient_accumulation_steps: int = 1,
                  max_grad_norm: float = 1.0,
                  log_interval: int = 50):
@@ -153,6 +154,7 @@ class Trainer:
         self.use_swa = use_swa
         self.swa = SWA(model) if use_swa else None
         self.swa_start_epoch = swa_start_epoch
+        self.swa_lr = swa_lr  # SWA期间使用的固定学习率
         
         # 梯度累积
         self.gradient_accumulation_steps = gradient_accumulation_steps
@@ -223,7 +225,44 @@ class Trainer:
                     aux_preds=outputs.get('aux')
                 )
                 
-                loss = losses['total'] / self.gradient_accumulation_steps
+                total_loss = losses['total']
+
+                if not torch.isfinite(total_loss):
+                    def _to_float(val):
+                        if isinstance(val, torch.Tensor):
+                            val = val.detach()
+                            if val.numel() == 0:
+                                return float('nan')
+                            return float(val.mean().cpu())
+                        try:
+                            return float(val)
+                        except Exception:
+                            return float('nan')
+
+                    loss_snapshot = {k: _to_float(v) for k, v in losses.items()}
+
+                    batch_ids = batch.get('id')
+                    if batch_ids is None:
+                        batch_ids = []
+                    elif isinstance(batch_ids, torch.Tensor):
+                        batch_ids = batch_ids.detach().cpu().tolist()
+                    elif not isinstance(batch_ids, (list, tuple)):
+                        batch_ids = [batch_ids]
+
+                    mask_per_sample = masks.detach().view(masks.size(0), -1).sum(dim=1)
+                    mask_sums = [float(x.cpu()) for x in mask_per_sample]
+
+                    self.logger.warning(
+                        "检测到非有限损失，跳过批次 | ids=%s | mask_sum=%s | losses=%s",
+                        batch_ids,
+                        mask_sums,
+                        loss_snapshot
+                    )
+
+                    self.optimizer.zero_grad()
+                    continue
+
+                loss = total_loss / self.gradient_accumulation_steps
             
             # 反向传播
             if self.use_amp:
@@ -297,7 +336,12 @@ class Trainer:
         
         # 学习率调度
         if self.scheduler and self.scheduler_step == 'epoch':
-            self.scheduler.step()
+            # SWA期间使用固定学习率
+            if self.use_swa and epoch >= self.swa_start_epoch and self.swa_lr is not None:
+                for param_group in self.optimizer.param_groups:
+                    param_group['lr'] = self.swa_lr
+            else:
+                self.scheduler.step()
         
         # SWA更新
         if self.use_swa and epoch >= self.swa_start_epoch:
@@ -392,11 +436,39 @@ class Trainer:
         """加载检查点"""
         checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
         
-        self.model.load_state_dict(checkpoint['model_state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        # 模型权重加载（宽松模式）
+        load_info = self.model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+
+        missing_keys = sorted(set(load_info.missing_keys))
+        unexpected_keys = sorted(set(load_info.unexpected_keys))
+
+        if missing_keys:
+            self.logger.warning(
+                "加载权重时存在缺失参数，将使用当前初始化值: %s",
+                missing_keys
+            )
+        if unexpected_keys:
+            self.logger.warning(
+                "加载权重时存在未使用的参数（已忽略）: %s",
+                unexpected_keys
+            )
+
+        # 优化器状态恢复（架构变化时可能失败）
+        try:
+            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        except (ValueError, RuntimeError, KeyError) as e:
+            self.logger.warning(
+                "优化器状态恢复失败，将使用新初始化的优化器: %s", str(e)
+            )
         
+        # 调度器状态恢复
         if self.scheduler and checkpoint.get('scheduler_state_dict'):
-            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            try:
+                self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            except (ValueError, RuntimeError, KeyError) as e:
+                self.logger.warning(
+                    "调度器状态恢复失败: %s", str(e)
+                )
         
         self.current_epoch = checkpoint['epoch'] + 1  # 从下一个epoch开始
         self.best_metric = checkpoint.get('best_metric', 0.0)

@@ -2,14 +2,160 @@
 SOTA模型架构: ConvNeXt + UPerNet
 结合边界感知分支和深度监督
 支持本地权重路径字符串（pretrained 可为 True/False 或 本地路径）
+
+优化版本：
+- 添加 DropPath (Stochastic Depth)
+- 升级注意力机制 (ECA + Coordinate Attention)
+- 改进特征融合 (ASPP-lite)
+- 可学习边界检测
 """
 import os
-from typing import List, Tuple
+import math
+from typing import List, Tuple, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import timm
+
+
+def drop_path(x: torch.Tensor, drop_prob: float = 0., training: bool = False) -> torch.Tensor:
+    """DropPath (Stochastic Depth) 正则化"""
+    if drop_prob == 0. or not training:
+        return x
+    keep_prob = 1 - drop_prob
+    shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+    random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+    random_tensor.floor_()
+    output = x.div(keep_prob) * random_tensor
+    return output
+
+
+class DropPath(nn.Module):
+    """DropPath (Stochastic Depth) 模块"""
+    def __init__(self, drop_prob: float = 0.):
+        super().__init__()
+        self.drop_prob = drop_prob
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return drop_path(x, self.drop_prob, self.training)
+
+
+class EfficientChannelAttention(nn.Module):
+    """高效通道注意力 (ECA) - 比SE更轻量且效果更好"""
+    def __init__(self, channels: int, gamma: int = 2, b: int = 1):
+        super().__init__()
+        # 自适应计算kernel size
+        t = int(abs((math.log2(channels) + b) / gamma))
+        k = t if t % 2 else t + 1
+        k = max(3, k)
+        
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.conv = nn.Conv1d(1, 1, kernel_size=k, padding=k//2, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # (B, C, 1, 1) -> (B, 1, C)
+        y = self.avg_pool(x).squeeze(-1).transpose(-1, -2)
+        y = self.conv(y).transpose(-1, -2).unsqueeze(-1)
+        y = self.sigmoid(y)
+        return x * y
+
+
+class CoordinateAttention(nn.Module):
+    """坐标注意力 - 同时编码通道和空间位置信息"""
+    def __init__(self, in_channels: int, reduction: int = 32):
+        super().__init__()
+        self.pool_h = nn.AdaptiveAvgPool2d((None, 1))
+        self.pool_w = nn.AdaptiveAvgPool2d((1, None))
+        
+        mid_channels = max(8, in_channels // reduction)
+        
+        self.conv1 = nn.Conv2d(in_channels, mid_channels, 1, bias=False)
+        self.bn1 = nn.BatchNorm2d(mid_channels)
+        self.act = nn.SiLU(inplace=True)  # Swish激活
+        
+        self.conv_h = nn.Conv2d(mid_channels, in_channels, 1, bias=False)
+        self.conv_w = nn.Conv2d(mid_channels, in_channels, 1, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = x.shape
+        
+        # 沿宽度和高度分别池化
+        x_h = self.pool_h(x)  # (B, C, H, 1)
+        x_w = self.pool_w(x).transpose(-1, -2)  # (B, C, 1, W) -> (B, C, W, 1)
+        
+        # 拼接并通过共享卷积
+        y = torch.cat([x_h, x_w], dim=2)  # (B, C, H+W, 1)
+        y = self.conv1(y)
+        y = self.bn1(y)
+        y = self.act(y)
+        
+        # 分离并生成注意力权重
+        x_h, x_w = torch.split(y, [H, W], dim=2)
+        x_w = x_w.transpose(-1, -2)
+        
+        a_h = self.sigmoid(self.conv_h(x_h))
+        a_w = self.sigmoid(self.conv_w(x_w))
+        
+        return x * a_h * a_w
+
+
+class ASPPLite(nn.Module):
+    """轻量级ASPP - 多尺度空洞卷积特征融合"""
+    def __init__(self, in_channels: int, out_channels: int, dilations: Tuple[int] = (1, 6, 12)):
+        super().__init__()
+        
+        # 确保通道数能被整除
+        branch_channels = out_channels // len(dilations)
+        # 计算合适的group数
+        branch_groups = min(8, branch_channels) if branch_channels >= 8 else max(1, branch_channels)
+        # 确保branch_channels能被branch_groups整除
+        while branch_channels % branch_groups != 0 and branch_groups > 1:
+            branch_groups -= 1
+        
+        self.convs = nn.ModuleList()
+        for dilation in dilations:
+            self.convs.append(
+                nn.Sequential(
+                    nn.Conv2d(in_channels, branch_channels, 3, 
+                              padding=dilation, dilation=dilation, bias=False),
+                    nn.GroupNorm(branch_groups, branch_channels),
+                    nn.ReLU(inplace=True)
+                )
+            )
+        
+        # 全局上下文
+        self.global_pool = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(in_channels, branch_channels, 1, bias=False),
+            nn.ReLU(inplace=True)
+        )
+        
+        # 融合
+        total_channels = branch_channels * (len(dilations) + 1)
+        out_groups = min(32, out_channels) if out_channels >= 32 else max(1, out_channels)
+        while out_channels % out_groups != 0 and out_groups > 1:
+            out_groups -= 1
+            
+        self.fuse = nn.Sequential(
+            nn.Conv2d(total_channels, out_channels, 1, bias=False),
+            nn.GroupNorm(out_groups, out_channels),
+            nn.ReLU(inplace=True),
+            nn.Dropout2d(0.1)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        size = x.shape[2:]
+        
+        features = [conv(x) for conv in self.convs]
+        
+        global_feat = self.global_pool(x)
+        global_feat = F.interpolate(global_feat, size=size, mode='bilinear', align_corners=False)
+        features.append(global_feat)
+        
+        return self.fuse(torch.cat(features, dim=1))
 
 
 class ConvNeXtEncoder(nn.Module):
@@ -107,8 +253,8 @@ class PSPModule(nn.Module):
 
         # 计算合适的group数
         psp_channels = out_channels // len(pool_sizes)
-        psp_groups = min(32, psp_channels) if psp_channels >= 32 else psp_channels
-        out_groups = min(32, out_channels) if out_channels >= 32 else out_channels
+        psp_groups = self._select_group_count(psp_channels)
+        out_groups = self._select_group_count(out_channels)
 
         self.stages = nn.ModuleList([
             nn.Sequential(
@@ -141,6 +287,16 @@ class PSPModule(nn.Module):
         out = self.conv_out(out)
 
         return out
+
+    @staticmethod
+    def _select_group_count(channels: int, max_groups: int = 32) -> int:
+        """选择能够整除通道数的最大分组数，避免 GroupNorm 抛出异常。"""
+        channels = max(channels, 1)
+        max_g = min(max_groups, channels)
+        for group in range(max_g, 0, -1):
+            if channels % group == 0:
+                return group
+        return 1
 
 
 class StripPooling(nn.Module):
@@ -185,36 +341,36 @@ class StripPooling(nn.Module):
 
 
 class CBAM(nn.Module):
-    """卷积块注意力模块（Convolutional Block Attention Module）"""
+    """增强版CBAM - 使用ECA替代原始通道注意力"""
 
-    def __init__(self, channels: int, reduction: int = 16):
+    def __init__(self, channels: int, reduction: int = 16, use_coord_att: bool = False):
         super().__init__()
-
-        # Channel Attention
-        self.channel_avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.channel_max_pool = nn.AdaptiveMaxPool2d(1)
-        self.channel_fc = nn.Sequential(
-            nn.Conv2d(channels, channels // reduction, 1, bias=False),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(channels // reduction, channels, 1, bias=False)
-        )
-
-        # Spatial Attention
-        self.spatial_conv = nn.Sequential(
-            nn.Conv2d(2, 1, 7, padding=3, bias=False),
-            nn.Sigmoid()
-        )
-
-        self.sigmoid = nn.Sigmoid()
+        
+        self.use_coord_att = use_coord_att
+        
+        if use_coord_att:
+            # 使用坐标注意力（同时编码通道和空间）
+            self.attention = CoordinateAttention(channels, reduction)
+        else:
+            # ECA通道注意力 + 空间注意力
+            self.channel_att = EfficientChannelAttention(channels)
+            
+            # 增强的空间注意力（使用深度可分离卷积）
+            self.spatial_conv = nn.Sequential(
+                nn.Conv2d(2, 8, 3, padding=1, bias=False),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(8, 1, 3, padding=1, bias=False),
+                nn.Sigmoid()
+            )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Channel Attention
-        avg_out = self.channel_fc(self.channel_avg_pool(x))
-        max_out = self.channel_fc(self.channel_max_pool(x))
-        channel_att = self.sigmoid(avg_out + max_out)
-        x = x * channel_att
+        if self.use_coord_att:
+            return self.attention(x)
+        
+        # ECA通道注意力
+        x = self.channel_att(x)
 
-        # Spatial Attention
+        # 增强空间注意力
         avg_out = torch.mean(x, dim=1, keepdim=True)
         max_out, _ = torch.max(x, dim=1, keepdim=True)
         spatial_att = self.spatial_conv(torch.cat([avg_out, max_out], dim=1))
@@ -224,46 +380,64 @@ class CBAM(nn.Module):
 
 
 class UPerNetDecoder(nn.Module):
-    """UPerNet解码器"""
+    """增强版UPerNet解码器 - 添加ASPP和DropPath"""
 
     def __init__(self,
                  encoder_channels: List[int],
                  decoder_channels: int = 256,
                  num_classes: int = 1,
-                 head_dropout: float = 0.1):
+                 head_dropout: float = 0.1,
+                 drop_path_rate: float = 0.1):
         super().__init__()
 
         # PPM模块（应用于最深层特征）
         self.ppm = PSPModule(encoder_channels[-1], decoder_channels)
+        
+        # 添加ASPP进行多尺度融合
+        self.aspp = ASPPLite(encoder_channels[-1], decoder_channels, dilations=(1, 6, 12))
 
         # 计算合适的group数
         dec_groups = min(32, decoder_channels) if decoder_channels >= 32 else decoder_channels
 
-        # FPN侧向连接
+        # FPN侧向连接（添加坐标注意力）
         self.lateral_convs = nn.ModuleList([
             nn.Sequential(
                 nn.Conv2d(ch, decoder_channels, 1, bias=False),
                 nn.GroupNorm(dec_groups, decoder_channels),
-                nn.ReLU(inplace=True)
+                nn.ReLU(inplace=True),
+                CoordinateAttention(decoder_channels, reduction=16)  # 添加坐标注意力
             )
             for ch in encoder_channels
         ])
 
-        # FPN输出卷积
-        self.fpn_convs = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv2d(decoder_channels, decoder_channels, 3, padding=1, bias=False),
-                nn.GroupNorm(dec_groups, decoder_channels),
-                nn.ReLU(inplace=True),
-                CBAM(decoder_channels)  # 添加注意力
+        # FPN输出卷积（添加DropPath）
+        self.fpn_convs = nn.ModuleList()
+        self.drop_paths = nn.ModuleList()
+        for i in range(len(encoder_channels)):
+            self.fpn_convs.append(
+                nn.Sequential(
+                    nn.Conv2d(decoder_channels, decoder_channels, 3, padding=1, bias=False),
+                    nn.GroupNorm(dec_groups, decoder_channels),
+                    nn.ReLU(inplace=True),
+                    CBAM(decoder_channels, use_coord_att=False)
+                )
             )
-            for _ in encoder_channels
-        ])
+            # 逐层递增的drop path率
+            dp_rate = drop_path_rate * i / max(len(encoder_channels) - 1, 1)
+            self.drop_paths.append(DropPath(dp_rate) if dp_rate > 0 else nn.Identity())
 
         # 条形池化（针对细长裂纹）
         self.strip_pool = StripPooling(decoder_channels * len(encoder_channels), decoder_channels)
+        
+        # 特征精炼模块
+        self.refine = nn.Sequential(
+            nn.Conv2d(decoder_channels * 2, decoder_channels, 1, bias=False),  # PPM + ASPP
+            nn.GroupNorm(dec_groups, decoder_channels),
+            nn.ReLU(inplace=True),
+            CBAM(decoder_channels, use_coord_att=True)
+        )
 
-        # 最终分类头
+        # 最终分类头（增强版）
         head_channels = decoder_channels // 2
         head_groups = min(16, head_channels) if head_channels >= 16 else head_channels
 
@@ -272,8 +446,15 @@ class UPerNetDecoder(nn.Module):
             nn.GroupNorm(head_groups, head_channels),
             nn.ReLU(inplace=True),
             nn.Dropout2d(head_dropout),
+            nn.Conv2d(head_channels, head_channels, 3, padding=1, bias=False),  # 额外一层
+            nn.GroupNorm(head_groups, head_channels),
+            nn.ReLU(inplace=True),
             nn.Conv2d(head_channels, num_classes, 1)
         )
+        
+        # 初始化最后一层
+        nn.init.zeros_(self.cls_head[-1].weight)
+        nn.init.zeros_(self.cls_head[-1].bias)
 
     def forward(self, features: List[torch.Tensor]) -> torch.Tensor:
         """
@@ -282,10 +463,16 @@ class UPerNetDecoder(nn.Module):
         Returns:
             output: (B, num_classes, H, W)
         """
-        # PPM处理最深层特征
-        fpn_features = [self.ppm(features[-1])]
+        # PPM和ASPP处理最深层特征
+        ppm_out = self.ppm(features[-1])
+        aspp_out = self.aspp(features[-1])
+        
+        # 融合PPM和ASPP
+        deep_feat = self.refine(torch.cat([ppm_out, aspp_out], dim=1))
+        
+        fpn_features = [deep_feat]
 
-        # 构建FPN（自顶向下）
+        # 构建FPN（自顶向下，带残差连接和DropPath）
         for i in range(len(features) - 2, -1, -1):
             lateral = self.lateral_convs[i](features[i])
 
@@ -297,7 +484,8 @@ class UPerNetDecoder(nn.Module):
                 align_corners=False
             )
 
-            fpn_feat = lateral + top_down
+            # 残差连接 + DropPath
+            fpn_feat = lateral + self.drop_paths[i](top_down)
             fpn_feat = self.fpn_convs[i](fpn_feat)
             fpn_features.insert(0, fpn_feat)
 
@@ -327,12 +515,12 @@ class UPerNetDecoder(nn.Module):
 
 
 class EdgeDetectionBranch(nn.Module):
-    """边界检测分支"""
+    """增强版边界检测分支 - 结合固定Sobel和可学习边界检测"""
 
     def __init__(self, in_channels: int, proj_channels: int = 256):
         super().__init__()
 
-        # 投影层（将输入特征投影到固定通道数）
+        # 投影层
         proj_groups = min(32, proj_channels) if proj_channels >= 32 else proj_channels
         self.proj = nn.Sequential(
             nn.Conv2d(in_channels, proj_channels, 1, bias=False),
@@ -340,49 +528,76 @@ class EdgeDetectionBranch(nn.Module):
             nn.ReLU(inplace=True)
         )
 
-        # Sobel算子提取边界（采用深度卷积实现）
+        # 固定Sobel算子（提供先验边界信息）
         self.sobel_x = nn.Conv2d(proj_channels, proj_channels, 3, padding=1, bias=False, groups=proj_channels)
         self.sobel_y = nn.Conv2d(proj_channels, proj_channels, 3, padding=1, bias=False, groups=proj_channels)
 
-        # 初始化Sobel核
         sobel_x_kernel = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32)
         sobel_y_kernel = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32)
 
-        # 为每个通道赋相同的核（使用 no_grad）
         with torch.no_grad():
-            # shape expected: (proj_channels, 1, 3, 3)
             for i in range(proj_channels):
                 self.sobel_x.weight.data[i, 0].copy_(sobel_x_kernel)
                 self.sobel_y.weight.data[i, 0].copy_(sobel_y_kernel)
             self.sobel_x.weight.requires_grad = False
             self.sobel_y.weight.requires_grad = False
 
-        # 边界特征增强
+        # 可学习边界检测器（多尺度）
+        self.learnable_edge = nn.ModuleList([
+            nn.Conv2d(proj_channels, proj_channels // 4, k, padding=k//2, bias=False, groups=proj_channels // 4)
+            for k in [3, 5, 7]  # 多尺度卷积
+        ])
+        
+        # 边界特征增强（融合固定+可学习）
         edge_groups = min(32, proj_channels) if proj_channels >= 32 else proj_channels
+        fuse_channels = proj_channels * 2 + proj_channels // 4 * 3  # sobel_x + sobel_y + 3个可学习
 
-        self.edge_conv = nn.Sequential(
-            nn.Conv2d(proj_channels * 2, proj_channels, 3, padding=1, bias=False),
+        self.edge_fuse = nn.Sequential(
+            nn.Conv2d(fuse_channels, proj_channels, 1, bias=False),
             nn.GroupNorm(edge_groups, proj_channels),
             nn.ReLU(inplace=True),
-            nn.Conv2d(proj_channels, 1, 1)
+            EfficientChannelAttention(proj_channels),  # 添加通道注意力
         )
+        
+        self.edge_head = nn.Sequential(
+            nn.Conv2d(proj_channels, proj_channels // 2, 3, padding=1, bias=False),
+            nn.GroupNorm(proj_channels // 2, proj_channels // 2),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(proj_channels // 2, 1, 1)
+        )
+        
+        # 初始化输出层
+        nn.init.zeros_(self.edge_head[-1].weight)
+        nn.init.zeros_(self.edge_head[-1].bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # 投影到固定通道数
         x = self.proj(x)
 
-        # 提取边界
+        # 固定Sobel边界
         edge_x = self.sobel_x(x)
         edge_y = self.sobel_y(x)
 
-        edges = torch.cat([edge_x, edge_y], dim=1)
-        edge_map = self.edge_conv(edges)
+        # 可学习多尺度边界
+        learned_edges = [conv(x) for conv in self.learnable_edge]
 
+        # 融合所有边界特征
+        all_edges = torch.cat([edge_x, edge_y] + learned_edges, dim=1)
+        fused = self.edge_fuse(all_edges)
+        
+        edge_map = self.edge_head(fused)
         return edge_map
 
 
 class ConvNeXtUPerNet(nn.Module):
-    """完整的ConvNeXt + UPerNet模型（带边界分支和深度监督）"""
+    """完整的ConvNeXt + UPerNet模型（带边界分支和深度监督）
+    
+    增强版特性:
+    - DropPath随机深度正则化
+    - ECA/CoordinateAttention通道注意力
+    - ASPP多尺度特征融合
+    - 可学习边界检测分支
+    - 多尺度边界金字塔
+    """
 
     def __init__(self,
                  encoder_name: str = 'convnext_tiny',
@@ -391,7 +606,8 @@ class ConvNeXtUPerNet(nn.Module):
                  decoder_channels: int = 256,
                  deep_supervision: bool = True,
                  edge_branch: bool = True,
-                 head_dropout: float = 0.1):
+                 head_dropout: float = 0.1,
+                 drop_path_rate: float = 0.1):
         super().__init__()
 
         self.deep_supervision = deep_supervision
@@ -401,8 +617,14 @@ class ConvNeXtUPerNet(nn.Module):
         self.encoder = ConvNeXtEncoder(encoder_name, pretrained)
         encoder_channels = self.encoder.out_channels
 
-        # 解码器
-        self.decoder = UPerNetDecoder(encoder_channels, decoder_channels, num_classes, head_dropout=head_dropout)
+        # 解码器 - 传入drop_path_rate
+        self.decoder = UPerNetDecoder(
+            encoder_channels, 
+            decoder_channels, 
+            num_classes, 
+            head_dropout=head_dropout,
+            drop_path_rate=drop_path_rate
+        )
 
         # 边界分支
         if edge_branch:
@@ -410,20 +632,26 @@ class ConvNeXtUPerNet(nn.Module):
             edge_in_channels = encoder_channels[-2]
             self.edge_head = EdgeDetectionBranch(edge_in_channels, decoder_channels)
 
-        # 深度监督辅助头
+        # 深度监督辅助头（增强稳定性）
         if deep_supervision:
             aux_channels = decoder_channels // 2
             aux_groups = min(16, aux_channels) if aux_channels >= 16 else aux_channels
 
             self.aux_heads = nn.ModuleList([
                 nn.Sequential(
-                    nn.Conv2d(ch, aux_channels, 3, padding=1),
+                    nn.Conv2d(ch, aux_channels, 3, padding=1, bias=False),
                     nn.GroupNorm(aux_groups, aux_channels),
                     nn.ReLU(inplace=True),
+                    nn.Dropout2d(0.1),  # 添加Dropout提高稳定性
                     nn.Conv2d(aux_channels, num_classes, 1)
                 )
                 for ch in encoder_channels[-3:]  # 使用后3层特征
             ])
+            
+            # 初始化辅助头的最后一层，使输出接近0
+            for aux_head in self.aux_heads:
+                nn.init.zeros_(aux_head[-1].weight)
+                nn.init.zeros_(aux_head[-1].bias)
 
     def forward(self, x: torch.Tensor) -> dict:
         """
@@ -456,18 +684,15 @@ class ConvNeXtUPerNet(nn.Module):
             edge_output = F.interpolate(edge_output, size=input_size, mode='bilinear', align_corners=False)
             results['edge'] = edge_output
 
-        # 深度监督
+        # 深度监督（带数值稳定性）
         if self.deep_supervision and self.training:
             aux_outputs = []
-            # encoder_channels[-3:] 创建了3个辅助头，分别对应 features[-3], features[-2], features[-1]
-            # aux_heads[0] 对应 encoder_channels[-3] -> features[-3]
-            # aux_heads[1] 对应 encoder_channels[-2] -> features[-2]
-            # aux_heads[2] 对应 encoder_channels[-1] -> features[-1]
             for i, aux_head in enumerate(self.aux_heads):
-                # 从 features[-3] 开始，依次使用 features[-3], features[-2], features[-1]
                 aux_feat = features[-3 + i]
                 aux_out = aux_head(aux_feat)
                 aux_out = F.interpolate(aux_out, size=input_size, mode='bilinear', align_corners=False)
+                # 对辅助输出进行clamp，防止极端值导致损失爆炸
+                aux_out = torch.clamp(aux_out, min=-20.0, max=20.0)
                 aux_outputs.append(aux_out)
             results['aux'] = aux_outputs
 
@@ -475,7 +700,18 @@ class ConvNeXtUPerNet(nn.Module):
 
 
 def create_model(model_config: dict) -> nn.Module:
-    """工厂函数创建模型"""
+    """工厂函数创建模型
+    
+    支持的配置参数:
+    - backbone: 编码器名称 (convnext_tiny/small/base)
+    - pretrained: 是否使用预训练权重
+    - num_classes: 输出类别数
+    - decoder_channels: 解码器通道数
+    - deep_supervision: 是否使用深度监督
+    - edge_branch: 是否使用边界分支
+    - head_dropout: 分类头dropout率
+    - drop_path_rate: 随机深度丢弃率
+    """
 
     model_type = model_config.get('backbone', 'convnext_tiny')
 
@@ -487,7 +723,8 @@ def create_model(model_config: dict) -> nn.Module:
             decoder_channels=model_config.get('decoder_channels', 256),
             deep_supervision=model_config.get('deep_supervision', True),
             edge_branch=model_config.get('edge_branch', True),
-            head_dropout=model_config.get('head_dropout', 0.1)
+            head_dropout=model_config.get('head_dropout', 0.1),
+            drop_path_rate=model_config.get('drop_path_rate', 0.1)
         )
     else:
         raise ValueError(f"Unsupported model type: {model_type}")
