@@ -8,13 +8,13 @@
     python dataset_selector.py --info
     
     # 准备单个数据集 (例如 CrackTree260，常用于论文对比)
-    python dataset_selector.py --datasets CrackTree260 --output ../data/cracktree260
+    python dataset_selector.py --datasets CrackTree260 --output ../../data/cracktree260
     
     # 准备多个数据集
-    python dataset_selector.py --datasets Crack500 CFD CrackTree260 --output ../data/mixed
+    python dataset_selector.py --datasets Crack500 CFD CrackTree260 --output ../../data/mixed
     
     # 准备所有数据集
-    python dataset_selector.py --datasets all --output ../data/all
+    python dataset_selector.py --datasets all --output ../../data/all
 
 支持的数据集:
     - AsphaltCrack300: 沥青路面裂缝 (~300张)
@@ -88,8 +88,8 @@ DATASET_REGISTRY = {
         'train_masks': 'CrackTree260_gt/gt',
         'val_images': None,
         'val_masks': None,
-        'image_ext': ['.jpg', '.JPG'],
-        'mask_ext': '.png',
+        'image_ext': '.jpg',  # Windows is case-insensitive, only use one extension
+        'mask_ext': '.bmp',   # Original GT files are .bmp format
         'expected_count': 260,
         'mask_in_subdir': True,
     },
@@ -366,7 +366,8 @@ class DatasetSelector:
                     
                     # 保存
                     name = f"{source}_{idx:05d}"
-                    cv2.imwrite(str(output_path / 'images' / split / f"{name}.png"), img)
+                    cv2.imwrite(str(output_path / 'images' / split / f"{name}.jpg"), img, 
+                               [cv2.IMWRITE_JPEG_QUALITY, 95])
                     cv2.imwrite(str(output_path / 'masks' / split / f"{name}.png"), mask)
                     
                     file_lists[split].append(name)

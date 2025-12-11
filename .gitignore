@@ -45,8 +45,7 @@ checkpoints/
 !checkpoints/.gitkeep
 
 # Data
-data/processed/images/
-data/processed/masks/
+data/
 !data/.gitkeep
 datasets/
 !datasets/.gitkeep

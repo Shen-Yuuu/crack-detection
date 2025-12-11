@@ -1,25 +1,25 @@
-# 优化后的裂纹检测训练配置 v2
-# 基于第一轮训练日志分析优化
+# 优化后的裂纹检测训练配置 v4
+# DeepCrack论文风格增强 + 额外性能优化
 
 # 数据集配置
 dataset:
-  root: "../data/processed"
+  root: "../data/cracktree260"
   image_dir: "images"
   mask_dir: "masks"
   crop_size: [512, 512]
-  train_scales: [[448, 448], [512, 512], [576, 576]]
+  train_scales: [[512, 512]]  # DeepCrack论文使用固定512x512
   normalize_mean: [0.485, 0.456, 0.406]
   normalize_std: [0.229, 0.224, 0.225]
   use_cache: false
   cache_dir: "./cache"
-  min_mask_ratio: 0.001
-  # 进一步降低MixUp/CutMix概率
-  mixup_prob: 0.10
-  cutmix_prob: 0.15
-  mix_alpha: 0.3
-  focus_crop_prob: 0.6  # 增加裂纹区域聚焦
+  min_mask_ratio: 0.0001  # 降低阈值，保留更多样本
+  # MixUp/CutMix - 可以帮助正则化和泛化
+  mixup_prob: 0.15    # 适度使用MixUp
+  cutmix_prob: 0.15   # 适度使用CutMix
+  mix_alpha: 0.4      # 较小的alpha避免过度混合
+  focus_crop_prob: 0.3  # 30%概率聚焦裁剪裂纹区域
   hard_mining_update_interval: 256
-
+  
 # 模型配置
 model:
   backbone: "convnext_small"
@@ -57,22 +57,22 @@ scheduler:
 
 # 训练配置
 training:
-  epochs: 300
+  epochs: 500  # 在线增强需要更多epochs来弥补数据量差距
   batch_size: 4
   num_workers: 4
-  output_dir: "./outputs_v2"  # 新输出目录
+  output_dir: "./outputs_v3"  # 新输出目录
   
   use_amp: true
   use_ema: true
   ema_decay: 0.9995
   use_swa: true
-  swa_start_epoch: 150  # 提前启动SWA
+  swa_start_epoch: 250  # 在更多epochs后启动SWA
   swa_lr: 0.0001        # SWA使用固定低学习率
   
   gradient_accumulation_steps: 2
   max_grad_norm: 0.5
   
-  early_stopping_patience: 40  # 增加patience
+  early_stopping_patience: 60  # 增加patience，在线增强收敛较慢
 
 # 推理配置
 inference:
