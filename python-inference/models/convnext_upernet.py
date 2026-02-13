@@ -452,10 +452,9 @@ class UPerNetDecoder(nn.Module):
             nn.Conv2d(head_channels, num_classes, 1)
         )
         
-        # 初始化最后一层 - 使用Xavier初始化权重，零初始化bias
-        nn.init.xavier_uniform_(self.cls_head[-1].weight)
-        if self.cls_head[-1].bias is not None:
-            nn.init.zeros_(self.cls_head[-1].bias)
+        # 初始化最后一层
+        nn.init.zeros_(self.cls_head[-1].weight)
+        nn.init.zeros_(self.cls_head[-1].bias)
 
     def forward(self, features: List[torch.Tensor]) -> torch.Tensor:
         """
@@ -567,10 +566,9 @@ class EdgeDetectionBranch(nn.Module):
             nn.Conv2d(proj_channels // 2, 1, 1)
         )
         
-        # 初始化输出层 - 使用Xavier初始化权重
-        nn.init.xavier_uniform_(self.edge_head[-1].weight)
-        if self.edge_head[-1].bias is not None:
-            nn.init.zeros_(self.edge_head[-1].bias)
+        # 初始化输出层
+        nn.init.zeros_(self.edge_head[-1].weight)
+        nn.init.zeros_(self.edge_head[-1].bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.proj(x)
@@ -650,11 +648,10 @@ class ConvNeXtUPerNet(nn.Module):
                 for ch in encoder_channels[-3:]  # 使用后3层特征
             ])
             
-            # 初始化辅助头的最后一层 - 使用Xavier初始化权重
+            # 初始化辅助头的最后一层，使输出接近0
             for aux_head in self.aux_heads:
-                nn.init.xavier_uniform_(aux_head[-1].weight)
-                if aux_head[-1].bias is not None:
-                    nn.init.zeros_(aux_head[-1].bias)
+                nn.init.zeros_(aux_head[-1].weight)
+                nn.init.zeros_(aux_head[-1].bias)
 
     def forward(self, x: torch.Tensor) -> dict:
         """

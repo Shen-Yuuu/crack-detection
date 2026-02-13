@@ -128,7 +128,6 @@ class Trainer:
                  ema_decay: float = 0.9995,
                  use_swa: bool = True,
                  swa_start_epoch: int = 180,
-                 swa_lr: Optional[float] = None,
                  gradient_accumulation_steps: int = 1,
                  max_grad_norm: float = 1.0,
                  log_interval: int = 50):
@@ -154,7 +153,6 @@ class Trainer:
         self.use_swa = use_swa
         self.swa = SWA(model) if use_swa else None
         self.swa_start_epoch = swa_start_epoch
-        self.swa_lr = swa_lr  # SWA期间使用的固定学习率
         
         # 梯度累积
         self.gradient_accumulation_steps = gradient_accumulation_steps
@@ -336,12 +334,7 @@ class Trainer:
         
         # 学习率调度
         if self.scheduler and self.scheduler_step == 'epoch':
-            # SWA期间使用固定学习率
-            if self.use_swa and epoch >= self.swa_start_epoch and self.swa_lr is not None:
-                for param_group in self.optimizer.param_groups:
-                    param_group['lr'] = self.swa_lr
-            else:
-                self.scheduler.step()
+            self.scheduler.step()
         
         # SWA更新
         if self.use_swa and epoch >= self.swa_start_epoch:

@@ -1,0 +1,91 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: cloud-gateway
+
+  cloud:
+    gateway:
+      # 全局跨域配置
+      globalcors:
+        cors-configurations:
+          '[/**]':
+            allowedOriginPatterns: "*"
+            allowedMethods: "*"
+            allowedHeaders: "*"
+            allowCredentials: true
+            maxAge: 3600
+
+      # 路由配置
+      routes:
+        # 认证服务
+        - id: cloud-auth
+          uri: http://localhost:8081
+          predicates:
+            - Path=/api/v1/auth/**
+          filters:
+            - StripPrefix=0
+
+        # 数据集服务
+        - id: cloud-dataset
+          uri: http://localhost:8082
+          predicates:
+            - Path=/api/v1/dataset/**
+          filters:
+            - StripPrefix=0
+            - AuthFilter
+
+        # 推理服务
+        - id: cloud-inference
+          uri: http://localhost:8083
+          predicates:
+            - Path=/api/v1/inference/**
+          filters:
+            - StripPrefix=0
+            - AuthFilter
+
+        # 可视化服务
+        - id: cloud-visual
+          uri: http://localhost:8084
+          predicates:
+            - Path=/api/v1/visual/**
+          filters:
+            - StripPrefix=0
+            - AuthFilter
+
+        # 报告服务
+        - id: cloud-report
+          uri: http://localhost:8085
+          predicates:
+            - Path=/api/v1/report/**
+          filters:
+            - StripPrefix=0
+            - AuthFilter
+
+  data:
+    redis:
+      host: localhost
+      port: 6379
+      database: 0
+
+# JWT配置
+jwt:
+  secret: crack-detection-system-secret-key-2024-very-long-secret-key-must-be-at-least-256-bits
+  access-token-expiration: 3600
+
+# 白名单路径（不需要认证）
+auth:
+  whitelist:
+    - /api/v1/auth/login
+    - /api/v1/auth/register
+    - /api/v1/auth/refresh
+    - /swagger-ui/**
+    - /v3/api-docs/**
+    - /doc.html
+    - /webjars/**
+
+logging:
+  level:
+    org.springframework.cloud.gateway: debug
+    com.crack.gateway: debug

@@ -218,16 +218,16 @@ class CrackDataset(Dataset):
         split_file = Path(self.config.root) / f"{self.config.split}.txt"
         
         print(f"\n{'='*60}")
-        print(f"[DEBUG] Loading {self.config.split} dataset")
+        print(f"🔍 调试信息 - 加载 {self.config.split} 数据集")
         print(f"{'='*60}")
-        print(f"[PATH] Root: {self.config.root}")
-        print(f"[PATH] Root (abs): {Path(self.config.root).resolve()}")
-        print(f"[FILE] Split file: {split_file}")
-        print(f"[FILE] Exists: {split_file.exists()}")
+        print(f"📂 Root路径: {self.config.root}")
+        print(f"📂 Root绝对路径: {Path(self.config.root).resolve()}")
+        print(f"📄 Split文件: {split_file}")
+        print(f"📄 Split文件存在: {split_file.exists()}")
         
         if not split_file.exists():
-            print(f"[ERROR] Split file not found!")
-            print(f"        Check path: {split_file.resolve()}")
+            print(f"❌ 错误: 找不到 split 文件!")
+            print(f"   请检查路径: {split_file.resolve()}")
             return []
         
         samples = []
@@ -242,7 +242,7 @@ class CrackDataset(Dataset):
         with open(split_file, 'r') as f:
             lines = f.readlines()
             total = len(lines)
-            print(f"[STATS] Total samples: {total}")
+            print(f"📊 总样本数: {total}")
             
             for idx, line in enumerate(lines):
                 sample_id = line.strip()
@@ -280,7 +280,7 @@ class CrackDataset(Dataset):
                 if mask_ratio < self.config.min_mask_ratio:
                     failed_checks['tiny_mask'] += 1
                     if idx < 3:
-                        print(f"  [SKIP] Mask ratio too low ({mask_ratio:.6f})")
+                        print(f"  ❌ 掩码有效像素过少 ({mask_ratio:.6f})")
                     continue
                 
                 # 质量检查（只检查前100个样本以加快速度）
@@ -294,11 +294,11 @@ class CrackDataset(Dataset):
                             'mask': str(mask_path)
                         })
                         if idx < 3:
-                            print(f"  [OK] Quality check passed")
+                            print(f"  ✅ 通过质量检查")
                     else:
                         failed_checks['size_mismatch'] += 1
                         if idx < 3:
-                            print(f"  [FAIL] Size mismatch")
+                            print(f"  ❌ 质量检查失败（尺寸不匹配）")
                 else:
                     # 后续样本跳过质量检查以加快速度
                     samples.append({
@@ -312,21 +312,21 @@ class CrackDataset(Dataset):
                     print(f"  进度: {idx+1}/{total} ({(idx+1)*100//total}%) - 已加载 {len(samples)} 个有效样本")
         
         print(f"\n{'='*60}")
-        print(f"[STATS] Loading summary:")
-        print(f"  - Total samples: {total}")
-        print(f"  - Image not found: {failed_checks['image_not_found']}")
-        print(f"  - Mask not found: {failed_checks['mask_not_found']}")
-        print(f"  - Size mismatch: {failed_checks['size_mismatch']}")
-        print(f"  - Mask ratio too low: {failed_checks['tiny_mask']}")
-        print(f"  - Successfully loaded: {len(samples)}")
+        print(f"📊 加载统计:")
+        print(f"  - 总样本数: {total}")
+        print(f"  - 图像未找到: {failed_checks['image_not_found']}")
+        print(f"  - 掩码未找到: {failed_checks['mask_not_found']}")
+        print(f"  - 尺寸不匹配: {failed_checks['size_mismatch']}")
+        print(f"  - 掩码占比过低: {failed_checks['tiny_mask']}")
+        print(f"  - 成功加载: {len(samples)}")
         print(f"{'='*60}\n")
         
         if len(samples) == 0:
-            print(f"[WARNING] No samples loaded!")
-            print(f"   Please check:")
-            print(f"   1. Dataset path is correct")
-            print(f"   2. Image and mask files exist")
-            print(f"   3. File extensions are .jpg and .png")
+            print(f"⚠️  警告: 没有加载到任何样本!")
+            print(f"   请检查:")
+            print(f"   1. 数据集路径是否正确")
+            print(f"   2. 图像和掩码文件是否存在")
+            print(f"   3. 文件扩展名是否为 .jpg 和 .png")
         
         return samples
     
@@ -597,80 +597,106 @@ class CrackDataset(Dataset):
         self._current_epoch_ratio = epoch_ratio
 
 
-def get_deepcrack_augmentation(config: DatasetConfig) -> A.Compose:
+def get_training_augmentation(config: DatasetConfig, epoch_ratio: float = 0.0) -> A.Compose:
     """
-    DeepCrack论文风格的数据增强策略
-    
-    原论文方法（离线增强，生成35,100张图像）:
-    - 9个旋转角度: 0°, 10°, 20°, 30°, 40°, 50°, 60°, 70°, 80°, 90°
-    - 每个角度: 水平翻转 + 垂直翻转 (4种组合)
-    - 每个翻转: 5个裁剪位置 (4角 + 中心)
-    - 260 * 9 * 4 * 5 = 46,800 (论文说35,100可能是只用了部分组合)
-    
-    在线随机增强版本:
-    - 随机选择一个旋转角度（0-90度，倾向于10度间隔的角度）
-    - 随机翻转
-    - 5个位置随机裁剪（4角 + 中心）
+    获取训练增强策略
+    epoch_ratio: 训练进度 0.0~1.0，用于动态调整增强强度
     """
-    crop_h, crop_w = int(config.crop_size[0]), int(config.crop_size[1])
+    # 动态调整增强强度（前60% epoch强增强，后40%弱增强）
+    strong_aug = epoch_ratio < 0.6
     
-    transforms = [
-        # 1. 确保图像足够大以进行裁剪
-        A.LongestMaxSize(max_size=max(crop_h, crop_w) * 2, p=1.0),
+    transforms = []
+    
+    # 几何增强
+    if strong_aug:
+        transforms.extend([
+            A.RandomScale(scale_limit=(-0.5, 1.0), p=0.5),
+            A.Rotate(limit=90, p=0.5),
+            A.Affine(scale=(0.8, 1.2), translate_percent=0.1, p=0.3),
+            A.ElasticTransform(alpha=50, sigma=5, p=0.3),  # 移除 alpha_affine
+        ])
+    else:
+        transforms.extend([
+            A.RandomScale(scale_limit=(-0.2, 0.2), p=0.3),
+            A.Rotate(limit=30, p=0.3),
+        ])
+    
+    # 翻转
+    transforms.extend([
+        A.HorizontalFlip(p=0.5),
+        A.VerticalFlip(p=0.3),
+    ])
+    
+    # 颜色增强
+    if strong_aug:
+        transforms.extend([
+            A.CLAHE(clip_limit=4.0, p=0.5),
+            A.RandomBrightnessContrast(brightness_limit=0.3, contrast_limit=0.3, p=0.5),
+            A.HueSaturationValue(hue_shift_limit=20, sat_shift_limit=30, val_shift_limit=20, p=0.5),
+            A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1, p=0.3),
+            A.RandomGamma(gamma_limit=(80, 120), p=0.3),
+            A.RandomShadow(p=0.3),
+            A.RandomFog(p=0.2),
+        ])
+    else:
+        transforms.extend([
+            A.CLAHE(clip_limit=2.0, p=0.3),
+            A.RandomBrightnessContrast(brightness_limit=0.1, contrast_limit=0.1, p=0.3),
+            A.RandomGamma(gamma_limit=(90, 110), p=0.2),
+        ])
+    
+    # 噪声与模糊
+    transforms.extend([
+        A.OneOf([
+            A.GaussNoise(p=1.0),  # 使用默认参数
+            A.ISONoise(color_shift=(0.01, 0.05), intensity=(0.1, 0.5), p=1.0),
+        ], p=0.3),
+        A.OneOf([
+            A.MotionBlur(blur_limit=7, p=1.0),
+            A.MedianBlur(blur_limit=7, p=1.0),
+            A.GaussianBlur(blur_limit=7, p=1.0),
+        ], p=0.2),
+        A.CoarseDropout(max_holes=12, max_height=32, max_width=32, min_holes=4, fill_value=0, p=0.3),
+        A.GridDropout(ratio=0.5, random_offset=True, p=0.15),
+    ])
+    
+    # 裁剪（多尺度训练）
+    if strong_aug and len(config.train_scales) > 0:
+        scale_choice = random.choice(list(config.train_scales))
+        if isinstance(scale_choice, (list, tuple)) and len(scale_choice) >= 2:
+            crop_h = int(scale_choice[0])
+            crop_w = int(scale_choice[1])
+        else:
+            crop_h = int(scale_choice)
+            aspect = float(config.crop_size[1]) / max(float(config.crop_size[0]), 1.0)
+            crop_w = max(1, int(round(crop_h * aspect)))
+    else:
+        crop_h, crop_w = int(config.crop_size[0]), int(config.crop_size[1])
+
+    crop_h = max(crop_h, 1)
+    crop_w = max(crop_w, 1)
+    max_side = max(crop_h, crop_w)
+
+    # 先确保图像大小足够进行裁剪
+    # 使用 LongestMaxSize + PadIfNeeded 确保图像不会太小
+    transforms.extend([
+        A.LongestMaxSize(max_size=max(max_side * 2, 1024), p=1.0),  # 确保图像足够大
         A.PadIfNeeded(
-            min_height=crop_h + 100,  # 额外padding以支持角落裁剪
-            min_width=crop_w + 100,
+            min_height=crop_h,
+            min_width=crop_w,
             border_mode=cv2.BORDER_REFLECT_101,
             p=1.0
         ),
-        
-        # 2. DeepCrack旋转策略: 0-90度，倾向于10度间隔
-        # 使用90度范围的旋转
-        A.Rotate(
-            limit=90,  # -90到+90度
-            interpolation=cv2.INTER_LINEAR,
-            border_mode=cv2.BORDER_REFLECT_101,
-            p=1.0  # 总是旋转
-        ),
-        
-        # 3. 翻转 (水平+垂直的所有组合)
-        A.HorizontalFlip(p=0.5),
-        A.VerticalFlip(p=0.5),
-        
-        # 4. 五点裁剪策略 (4角+中心) - 使用RandomCrop模拟
-        # RandomCrop会随机选择位置，但我们用CenterCrop和RandomCrop的组合
-        A.OneOf([
-            # 中心裁剪
-            A.CenterCrop(height=crop_h, width=crop_w),
-            # 随机裁剪 (模拟4角)
-            A.RandomCrop(height=crop_h, width=crop_w),
-            A.RandomCrop(height=crop_h, width=crop_w),
-            A.RandomCrop(height=crop_h, width=crop_w),
-            A.RandomCrop(height=crop_h, width=crop_w),
-        ], p=1.0),
-        
-        # 5. 轻度颜色增强（保持与原图相似）
-        A.OneOf([
-            A.RandomBrightnessContrast(brightness_limit=0.1, contrast_limit=0.1, p=1.0),
-            A.CLAHE(clip_limit=2.0, p=1.0),
-            A.RandomGamma(gamma_limit=(90, 110), p=1.0),
-        ], p=0.3),
-        
-        # 6. 归一化与转换
+        A.RandomCrop(height=crop_h, width=crop_w, p=1.0)
+    ])
+    
+    # 归一化与转换
+    transforms.extend([
         A.Normalize(mean=config.normalize_mean, std=config.normalize_std),
         ToTensorV2(),
-    ]
+    ])
     
     return A.Compose(transforms)
-
-
-def get_training_augmentation(config: DatasetConfig, epoch_ratio: float = 0.0) -> A.Compose:
-    """
-    获取训练增强策略 - 使用DeepCrack风格增强
-    epoch_ratio: 训练进度 0.0~1.0，用于动态调整增强强度
-    """
-    # 使用DeepCrack风格的增强策略
-    return get_deepcrack_augmentation(config)
 
 
 def get_validation_augmentation(config: DatasetConfig) -> A.Compose:
